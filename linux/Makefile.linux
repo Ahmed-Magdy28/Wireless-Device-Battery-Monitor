@@ -1,18 +1,19 @@
-# Linux (Fedora / Ubuntu) build. Kept separate from the Windows Makefile so the existing
-# MinGW build stays untouched. GTK4/GIO provide the StatusNotifierItem tray icon; HID access goes
-# straight to hidraw, so no extra HID library is needed.
+# Linux (Ubuntu / Debian / Fedora) build. Kept separate from the Windows Makefile so the existing
+# MinGW build stays untouched. GIO provides the StatusNotifierItem tray icon over D-Bus and Cairo
+# renders the icon; HID access goes straight to hidraw, so no extra HID library is needed.
 #
-# Fedora:   sudo dnf install gcc-c++ make gtk4-devel cairo-devel
-# Ubuntu:   sudo apt install g++ make libgtk-4-dev libcairo2-dev
+# Ubuntu/Debian: sudo apt install g++ make libgtk-3-dev libcairo2-dev
+# Fedora:        sudo dnf install gcc-c++ make gtk3-devel cairo-devel
 #
 # ./build-linux.sh          (from the repository root; same as: make -f linux/Makefile.linux)
+# ./build-linux.sh deb      (build a .deb package in dist/)
 # ./build-linux.sh clean
 
 CXX      ?= g++
 PKGCONFIG ?= pkg-config
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wno-missing-field-initializers
-GTK_CFLAGS := $(shell $(PKGCONFIG) --cflags gtk4 cairo)
-GTK_LIBS   := $(shell $(PKGCONFIG) --libs gtk4 cairo)
+GIO_CFLAGS := $(shell $(PKGCONFIG) --cflags gtk+-3.0 gio-2.0 cairo)
+GIO_LIBS   := $(shell $(PKGCONFIG) --libs gtk+-3.0 gio-2.0 cairo)
 
 # Phase 1: famous vendors whose drivers only need the portable HID API.
 DRIVERS := \
@@ -32,18 +33,21 @@ OBJ := $(patsubst src/%.cpp,build/linux/%.o,$(SRC))
 TARGET := wireless-battery
 
 $(TARGET): $(OBJ)
-	$(CXX) $^ -o $@ $(GTK_LIBS) -pthread
+	$(CXX) $^ -o $@ $(GIO_LIBS) -pthread
 
 build/linux/%.o: src/%.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) $(GTK_CFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(GIO_CFLAGS) -c $< -o $@
 
 test:
 	@mkdir -p build/linux
 	$(CXX) $(CXXFLAGS) tests/linux_hid_test.cpp -o build/linux/linux_hid_test
 	./build/linux/linux_hid_test
 
-clean:
-	rm -rf build/linux $(TARGET)
+deb:
+	./linux/build-deb.sh
 
-.PHONY: clean test
+clean:
+	rm -rf build/linux build/deb $(TARGET)
+
+.PHONY: clean test deb

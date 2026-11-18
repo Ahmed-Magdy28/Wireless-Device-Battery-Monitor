@@ -1,4 +1,4 @@
-// Linux entry point: a StatusNotifierItem (system tray) app built with GTK4/GIO.
+// Linux entry point: a GTK3 status window + StatusNotifierItem (system tray) app.
 //
 // Kept separate from src/main.cpp (Win32 tray + taskbar widget) so the Windows build is not
 // touched. The polling logic and all vendor drivers are shared; only the presentation layer and
@@ -46,6 +46,15 @@ struct MenuNode {
 
 struct State {
     GtkApplication* app = nullptr;
+    GtkWidget* window = nullptr;
+    GtkWidget* deviceList = nullptr;
+    GtkWidget* emptyLabel = nullptr;
+    GtkWidget* hidDumpView = nullptr;
+    GtkWidget* hidExpander = nullptr;
+    GtkWidget* hideLastKnownCheck = nullptr;
+    GtkWidget* autostartCheck = nullptr;
+    bool startInTray = false;
+    bool updatingUi = false;
     GDBusConnection* conn = nullptr;
     GVariant* pixmap = nullptr;           // a(iiay), cached for SNI property reads
     std::string tooltip = "Wireless Battery";
@@ -91,7 +100,8 @@ void SaveSettings() {
     g_key_file_set_boolean(kf, "general", "hide-last-known", g.hideLastKnown);
     g_key_file_set_boolean(kf, "general", "autostart", g.autostart);
     std::string path = ConfigPath();
-    g_mkdir_with_parents(g_path_get_dirname(path.c_str()), 0700);
+    g_autofree gchar* dir = g_path_get_dirname(path.c_str());
+    g_mkdir_with_parents(dir, 0700);
     g_key_file_save_to_file(kf, path.c_str(), nullptr);
 }
 
@@ -102,13 +112,14 @@ std::string DesktopPath() {
 void ApplyAutostart(bool on) {
     std::string path = DesktopPath();
     if (!on) { unlink(path.c_str()); return; }
-    g_mkdir_with_parents(g_path_get_dirname(path.c_str()), 0700);
+    g_autofree gchar* dir = g_path_get_dirname(path.c_str());
+    g_mkdir_with_parents(dir, 0700);
     g_autofree gchar* exe = g_file_read_link("/proc/self/exe", nullptr);
     if (!exe) return;
     std::string content =
         "[Desktop Entry]\nType=Application\nName=Wireless Battery\n"
         "Comment=Show battery levels of wireless devices in the tray\n"
-        "Exec=\"" + std::string(exe) + "\"\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n";
+        "Exec=\"" + std::string(exe) + "\" --tray\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n";
     g_file_set_contents(path.c_str(), content.c_str(), (gssize)content.size(), nullptr);
 }
 
@@ -289,6 +300,7 @@ void RebuildMenu() {
     }
     if (!shown) AddMenuNode(0, "No devices with battery info found", "");
     AddMenuNode(0, "", "", true);
+    AddMenuNode(0, "Open Window", "show-window");
     AddMenuNode(0, "Refresh now", "refresh");
     AddMenuNode(0, g.hideLastKnown ? "Hide last known / asleep devices (on)"
                                   : "Hide last known / asleep devices (off)",
@@ -303,6 +315,8 @@ void RebuildMenu() {
         g_dbus_connection_emit_signal(g.conn, nullptr, kMenuPath, "com.canonical.dbusmenu",
                                       "LayoutUpdated", g_variant_new("(ii)", g.menuRevision, 0), nullptr);
 }
+
+void RefreshWindow();
 
 void RecomputePresentation() {
     int pct = -1;
@@ -327,6 +341,7 @@ void RecomputePresentation() {
     EmitSignal("NewIcon");
     EmitSignal("NewToolTip");
     EmitSignal("NewStatus");
+    RefreshWindow();
 }
 
 void ApplyResults() {
@@ -394,7 +409,7 @@ static GVariant* sni_get_property(GDBusConnection*, const gchar*, const gchar*, 
     if (!strcmp(name, "Id")) return g_variant_new_string("wireless-battery");
     if (!strcmp(name, "Category")) return g_variant_new_string("SystemServices");
     if (!strcmp(name, "Title")) return g_variant_new_string("Wireless Battery");
-    if (!strcmp(name, "IconName")) return g_variant_new_string("battery-good-symbolic");
+    if (!strcmp(name, "IconName")) return g_variant_new_string("");
     if (!strcmp(name, "IconPixmap"))
         return g.pixmap ? g_variant_ref(g.pixmap) : RenderPixmap(-1, false, true, false);
     if (!strcmp(name, "ToolTip")) {
@@ -406,7 +421,7 @@ static GVariant* sni_get_property(GDBusConnection*, const gchar*, const gchar*, 
     if (!strcmp(name, "Status")) {
         bool low = false;
         for (const auto& s : g.devices) low |= (s.percent >= 0 && s.percent <= kLowBattery && !s.charging);
-        return g_variant_new_string(low ? "NeedsAttention" : (g.devices.empty() ? "Passive" : "Active"));
+        return g_variant_new_string(low ? "NeedsAttention" : "Active");
     }
     return nullptr;
 }
@@ -528,19 +543,28 @@ void RegisterInterfaces(GDBusConnection* conn) {
     g_dbus_node_info_unref(node);
 }
 
+void RegisterWithWatcher(GDBusConnection* conn, const char* watcher) {
+    GError* error = nullptr;
+    GVariant* reply = g_dbus_connection_call_sync(conn, watcher, "/StatusNotifierWatcher", watcher,
+                                                  "RegisterStatusNotifierItem",
+                                                  g_variant_new("(s)", kSniPath), nullptr,
+                                                  G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
+    if (reply) g_variant_unref(reply);
+    if (error) g_error_free(error);
+}
+
+void OnWatcherAppeared(GDBusConnection* conn, const gchar* name, const gchar*, gpointer) {
+    RegisterWithWatcher(conn, name);
+}
+
 void OnBusAcquired(GDBusConnection* conn, const gchar*, gpointer) {
     g.conn = conn;
     RegisterInterfaces(conn);
-    // Register with the KDE/AppIndicator watcher (falls back to the freedesktop name).
+    // Watch KDE and freedesktop watchers so registration succeeds even if the shell tray starts later.
     const char* watchers[] = { "org.kde.StatusNotifierWatcher", "org.freedesktop.StatusNotifierWatcher" };
     for (auto w : watchers) {
-        GError* error = nullptr;
-        GVariant* reply = g_dbus_connection_call_sync(conn, w, "/StatusNotifierWatcher", w,
-                                                      "RegisterStatusNotifierItem",
-                                                      g_variant_new("(s)", kSniPath), nullptr,
-                                                      G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &error);
-        if (reply) { g_variant_unref(reply); if (error) g_error_free(error); break; }
-        if (error) g_error_free(error);
+        g_bus_watch_name_on_connection(conn, w, G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                       OnWatcherAppeared, nullptr, nullptr, nullptr);
     }
     RecomputePresentation();
 }
@@ -581,10 +605,196 @@ void OnDevice(GSimpleAction*, GVariant*, gpointer data) {
     RecomputePresentation();
 }
 
+void OnQuit(GSimpleAction*, GVariant*, gpointer) {
+    g_application_quit(G_APPLICATION(g.app));
+}
+
+const char* KindLabel(DeviceKind k) {
+    switch (k) {
+        case DeviceKind::Headset: return "Headset";
+        case DeviceKind::Mouse: return "Mouse";
+        case DeviceKind::Keyboard: return "Keyboard";
+        case DeviceKind::Gamepad: return "Gamepad";
+        case DeviceKind::Phone: return "Phone";
+        default: return "Device";
+    }
+}
+
+void RefreshWindow() {
+    if (!g.window || !g.deviceList) return;
+    g.updatingUi = true;
+
+    GList* children = gtk_container_get_children(GTK_CONTAINER(g.deviceList));
+    for (GList* l = children; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(children);
+
+    std::vector<const DeviceStatus*> list;
+    for (const auto& s : g.devices) list.push_back(&s);
+    std::sort(list.begin(), list.end(), [](const DeviceStatus* a, const DeviceStatus* b) {
+        int ka = KindOrder(a->kind), kb = KindOrder(b->kind);
+        return ka != kb ? ka < kb : a->name < b->name;
+    });
+
+    gtk_widget_set_visible(g.emptyLabel, list.empty());
+    gtk_widget_set_visible(g.deviceList, !list.empty());
+
+    for (const auto* s : list) {
+        GtkWidget* row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+        gtk_container_set_border_width(GTK_CONTAINER(row), 8);
+
+        GtkWidget* info = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+        std::string titleText = WideToUtf8(s->name);
+        GtkWidget* title = gtk_label_new(nullptr);
+        g_autofree gchar* markup = g_markup_printf_escaped("<b>%s</b>", titleText.c_str());
+        gtk_label_set_markup(GTK_LABEL(title), markup);
+        gtk_widget_set_halign(title, GTK_ALIGN_START);
+
+        std::string subText = std::string(KindLabel(s->kind)) + "  •  " + WideToUtf8(s->via);
+        GtkWidget* sub = gtk_label_new(subText.c_str());
+        gtk_widget_set_halign(sub, GTK_ALIGN_START);
+        gtk_style_context_add_class(gtk_widget_get_style_context(sub), "dim-label");
+
+        gtk_box_pack_start(GTK_BOX(info), title, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(info), sub, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), info, TRUE, TRUE, 0);
+
+        std::string statusStr = WideToUtf8(StatusText(*s));
+        GtkWidget* statusLbl = gtk_label_new(statusStr.c_str());
+        gtk_box_pack_start(GTK_BOX(row), statusLbl, FALSE, FALSE, 0);
+
+        GtkWidget* toggle = gtk_check_button_new_with_label("Show in tray");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(toggle), g.hidden.count(s->key) == 0);
+        g_object_set_data_full(G_OBJECT(toggle), "device-key", g_strdup(WideToUtf8(s->key).c_str()), g_free);
+        g_signal_connect(toggle, "toggled", G_CALLBACK(+[](GtkToggleButton* btn, gpointer) {
+            if (g.updatingUi) return;
+            const char* k = static_cast<const char*>(g_object_get_data(G_OBJECT(btn), "device-key"));
+            if (!k) return;
+            std::wstring wk = Utf8ToWide(k);
+            if (gtk_toggle_button_get_active(btn)) g.hidden.erase(wk);
+            else g.hidden.insert(wk);
+            SaveSettings();
+            RecomputePresentation();
+        }), nullptr);
+        gtk_box_pack_start(GTK_BOX(row), toggle, FALSE, FALSE, 0);
+
+        gtk_list_box_insert(GTK_LIST_BOX(g.deviceList), row, -1);
+    }
+
+    if (g.hideLastKnownCheck)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g.hideLastKnownCheck), g.hideLastKnown);
+    if (g.autostartCheck)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(g.autostartCheck), g.autostart);
+
+    if (g.hidDumpView && g.hidExpander && gtk_expander_get_expanded(GTK_EXPANDER(g.hidExpander))) {
+        std::string dump = WideToUtf8(DumpHidCollections());
+        GtkTextBuffer* buf = gtk_text_view_get_buffer(GTK_TEXT_VIEW(g.hidDumpView));
+        gtk_text_buffer_set_text(buf, dump.c_str(), (gint)dump.size());
+    }
+
+    gtk_widget_show_all(g.deviceList);
+    g.updatingUi = false;
+}
+
+void EnsureWindow() {
+    if (g.window) return;
+
+    g.window = gtk_application_window_new(g.app);
+    gtk_window_set_title(GTK_WINDOW(g.window), "Wireless Battery");
+    gtk_window_set_default_size(GTK_WINDOW(g.window), 520, 380);
+    gtk_window_set_icon_name(GTK_WINDOW(g.window), "wireless-battery");
+    g_signal_connect(g.window, "delete-event", G_CALLBACK(gtk_widget_hide_on_delete), nullptr);
+
+    GtkWidget* root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(root), 14);
+    gtk_container_add(GTK_CONTAINER(g.window), root);
+
+    GtkWidget* header = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget* heading = gtk_label_new(nullptr);
+    gtk_label_set_markup(GTK_LABEL(heading), "<big><b>Wireless Devices</b></big>");
+    gtk_widget_set_halign(heading, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(header), heading, TRUE, TRUE, 0);
+
+    GtkWidget* refreshBtn = gtk_button_new_with_label("Refresh");
+    g_signal_connect(refreshBtn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer) {
+        OnRefresh(nullptr, nullptr, nullptr);
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(header), refreshBtn, FALSE, FALSE, 0);
+
+    GtkWidget* quitBtn = gtk_button_new_with_label("Quit");
+    g_signal_connect(quitBtn, "clicked", G_CALLBACK(+[](GtkButton*, gpointer) {
+        g_application_quit(G_APPLICATION(g.app));
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(header), quitBtn, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), header, FALSE, FALSE, 0);
+
+    g.emptyLabel = gtk_label_new(
+        "No wireless devices with battery info found.\n\n"
+        "Make sure your receiver is plugged in or the device is awake.\n"
+        "If you just installed the package, replug the receiver or log out and back in.");
+    gtk_label_set_justify(GTK_LABEL(g.emptyLabel), GTK_JUSTIFY_CENTER);
+    gtk_label_set_line_wrap(GTK_LABEL(g.emptyLabel), TRUE);
+    gtk_box_pack_start(GTK_BOX(root), g.emptyLabel, TRUE, TRUE, 8);
+
+    GtkWidget* scroller = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    g.deviceList = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(g.deviceList), GTK_SELECTION_NONE);
+    gtk_container_add(GTK_CONTAINER(scroller), g.deviceList);
+    gtk_box_pack_start(GTK_BOX(root), scroller, TRUE, TRUE, 0);
+
+    g.hidExpander = gtk_expander_new("Detected HID Devices (diagnostic)");
+    GtkWidget* dumpScroll = gtk_scrolled_window_new(nullptr, nullptr);
+    gtk_widget_set_size_request(dumpScroll, -1, 130);
+    g.hidDumpView = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(g.hidDumpView), FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(g.hidDumpView), TRUE);
+    gtk_container_add(GTK_CONTAINER(dumpScroll), g.hidDumpView);
+    gtk_container_add(GTK_CONTAINER(g.hidExpander), dumpScroll);
+    g_signal_connect(g.hidExpander, "notify::expanded", G_CALLBACK(+[](GObject*, GParamSpec*, gpointer) {
+        RefreshWindow();
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(root), g.hidExpander, FALSE, FALSE, 0);
+
+    GtkWidget* footer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 16);
+    g.hideLastKnownCheck = gtk_check_button_new_with_label("Hide last known / asleep devices");
+    g_signal_connect(g.hideLastKnownCheck, "toggled", G_CALLBACK(+[](GtkToggleButton* btn, gpointer) {
+        if (g.updatingUi) return;
+        g.hideLastKnown = gtk_toggle_button_get_active(btn);
+        SaveSettings();
+        RecomputePresentation();
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(footer), g.hideLastKnownCheck, FALSE, FALSE, 0);
+
+    g.autostartCheck = gtk_check_button_new_with_label("Start at login");
+    g_signal_connect(g.autostartCheck, "toggled", G_CALLBACK(+[](GtkToggleButton* btn, gpointer) {
+        if (g.updatingUi) return;
+        g.autostart = gtk_toggle_button_get_active(btn);
+        SaveSettings();
+        ApplyAutostart(g.autostart);
+    }), nullptr);
+    gtk_box_pack_start(GTK_BOX(footer), g.autostartCheck, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), footer, FALSE, FALSE, 0);
+}
+
+void ShowWindow() {
+    EnsureWindow();
+    RefreshWindow();
+    gtk_widget_show_all(g.window);
+    RefreshWindow();
+    gtk_window_present(GTK_WINDOW(g.window));
+}
+
+void OnShowWindow(GSimpleAction*, GVariant*, gpointer) {
+    ShowWindow();
+}
+
 const GActionEntry kActions[] = {
+    { "show-window", OnShowWindow, nullptr, nullptr, nullptr, {} },
     { "refresh", OnRefresh, nullptr, nullptr, nullptr, {} },
     { "toggle-last-known", OnToggleLastKnown, nullptr, "false", nullptr, {} },
     { "toggle-autostart", OnToggleAutostart, nullptr, "false", nullptr, {} },
+    { "quit", OnQuit, nullptr, nullptr, nullptr, {} },
 };
 
 gboolean PushResults(gpointer) {
@@ -593,7 +803,11 @@ gboolean PushResults(gpointer) {
 }
 
 void OnActivate(GApplication*) {
-    // Tray-only app: nothing to present on activation.
+    if (g.startInTray) {
+        g.startInTray = false;
+        return;
+    }
+    ShowWindow();
 }
 
 // ---- worker ------------------------------------------------------------------------------------
@@ -648,17 +862,30 @@ int QuitRunning() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::vector<char*> gtkArgs;
+    gtkArgs.push_back(argv[0]);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--list")) return ListToConsole(false);
         if (!strcmp(argv[i], "--dump")) return ListToConsole(true);
         if (!strcmp(argv[i], "--quit")) return QuitRunning();
+        if (!strcmp(argv[i], "--tray")) { g.startInTray = true; continue; }
+        gtkArgs.push_back(argv[i]);
     }
+    int gtkArgc = (int)gtkArgs.size();
 
     LoadSettings();
     g_autoptr(GError) error = nullptr;
-    if (!gtk_init_check()) { fprintf(stderr, "Cannot initialise GTK (no display?).\n"); return 1; }
+    if (!gtk_init_check(&gtkArgc, &argv)) {
+        fprintf(stderr, "Cannot initialise GTK (no display?).\n");
+        return 1;
+    }
 
-    g.app = GTK_APPLICATION(gtk_application_new(kAppId, G_APPLICATION_DEFAULT_FLAGS));
+#if GLIB_CHECK_VERSION(2, 74, 0)
+    GApplicationFlags appFlags = G_APPLICATION_DEFAULT_FLAGS;
+#else
+    GApplicationFlags appFlags = G_APPLICATION_FLAGS_NONE;
+#endif
+    g.app = gtk_application_new(kAppId, appFlags);
     g_action_map_add_action_entries(G_ACTION_MAP(g.app), kActions, G_N_ELEMENTS(kActions), nullptr);
     // Up to 32 device toggle actions, rebound to the current device list whenever the menu is rebuilt.
     for (intptr_t i = 0; i < 32; i++) {
@@ -669,17 +896,21 @@ int main(int argc, char** argv) {
     }
 
     if (!g_application_register(G_APPLICATION(g.app), nullptr, &error)) {
-        fprintf(stderr, "Cannot register application (already running?): %s\n", error->message);
+        fprintf(stderr, "Cannot register application: %s\n", error->message);
         return 1;
     }
-    // GApplication already owns kAppId; reuse its connection for StatusNotifierItem.
-    OnBusAcquired(g_application_get_dbus_connection(G_APPLICATION(g.app)), kAppId, nullptr);
 
     g_signal_connect(g.app, "activate", G_CALLBACK(OnActivate), nullptr);
-    // No GTK window is ever created (tray only), so hold the application explicitly.
+
+    if (g_application_get_is_remote(G_APPLICATION(g.app))) {
+        return g_application_run(G_APPLICATION(g.app), gtkArgc, gtkArgs.data());
+    }
+
+    // Primary instance: reuse GApplication's D-Bus connection for StatusNotifierItem and keep running in tray.
+    OnBusAcquired(g_application_get_dbus_connection(G_APPLICATION(g.app)), kAppId, nullptr);
     g_application_hold(G_APPLICATION(g.app));
     std::thread worker(Worker);
-    int status = g_application_run(G_APPLICATION(g.app), argc, argv);
+    int status = g_application_run(G_APPLICATION(g.app), gtkArgc, gtkArgs.data());
     g.stop = true;
     g.cv.notify_all();
     worker.join();

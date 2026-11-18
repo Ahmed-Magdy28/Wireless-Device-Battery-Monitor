@@ -218,22 +218,30 @@ just lose the extra headsets.
 ## Linux (experimental)
 
 A Linux build sits alongside the Windows app. It uses the same vendor drivers with a hidraw-based
-HID backend and a GTK4 StatusNotifierItem tray icon; the Windows code path is unchanged.
+HID backend and a GIO/Cairo StatusNotifierItem tray icon; the Windows code path is unchanged.
 All Linux-only files are in `linux/` and `src/linux/`, and `build-linux.sh` builds it (Windows keeps using `build.bat`).
 
 | | Fedora | Ubuntu / Debian |
 |---|---|---|
 | Compiler & make | `sudo dnf install gcc-c++ make` | `sudo apt install g++ make` |
-| GTK4 + Cairo | `sudo dnf install gtk4-devel cairo-devel` | `sudo apt install libgtk-4-dev libcairo2-dev` |
+| GLib/GIO + GTK3 + Cairo | `sudo dnf install gtk3-devel cairo-devel` | `sudo apt install libgtk-3-dev libcairo2-dev` |
 
 No extra HID library is needed (hidraw is used directly).
 
 ```sh
 ./build-linux.sh
 ./build-linux.sh test         # unit test for the HID report-descriptor parser
+./build-linux.sh deb          # build an Ubuntu/Debian .deb package in dist/
 ./wireless-battery --list     # print detected levels and exit
 ./wireless-battery --dump     # list HID collections
 ./wireless-battery --quit     # close the running tray instance
+```
+
+On Ubuntu/Debian, installing the generated `.deb` package sets up the binary, desktop entry, icon,
+and udev rule automatically:
+
+```sh
+sudo apt install ./dist/wireless-battery_*.deb
 ```
 
 HID access needs a udev rule, otherwise the app starts but finds no devices:
